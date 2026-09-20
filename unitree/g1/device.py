@@ -4393,6 +4393,11 @@ class VisionCapturePlugin:
         self._fps = max(1, min(15, int(plugin_config.get("fps", 15))))
         self._max_duration_s = max(
             1, min(30, int(plugin_config.get("max_duration_s", 30))))
+        # analyze: 平均亮度低于 dark_threshold 判 dark，高于 lit_threshold 判 lit，
+        # 之间为 uncertain。数值为 8 位灰度，可按现场相机曝光在 config.yaml 调整。
+        self._dark_threshold = float(plugin_config.get("dark_threshold", 60))
+        self._lit_threshold = float(plugin_config.get("lit_threshold", 110))
+        self._last_photo_path = None
         self._recording_lock = threading.Lock()
         self._active_recording = None
         self._last_recording = None
@@ -4406,7 +4411,13 @@ class VisionCapturePlugin:
                 "card to remain enabled (plugins.camera.enabled=true)."),
             "inputSchema": {"type": "object", "properties": {
                 "action": {"type": "string", "enum": [
-                    "start", "capture_photo", "record_video", "info", "stop"]},
+                    "start", "capture_photo", "analyze", "record_video", "info",
+                    "stop"]},
+                "image_path": {
+                    "type": "string",
+                    "description": ("要分析的照片路径（须在 photos 目录内）；"
+                                    "留空则分析最近一张 capture_photo 保存的照片"),
+                },
                 "duration_s": {
                     "type": "integer", "minimum": 1,
                     "maximum": self._max_duration_s,
@@ -4417,6 +4428,10 @@ class VisionCapturePlugin:
                 "x-action-params": {
                     "start": {"params": [], "description": "检查 RGB 相机是否就绪。"},
                     "capture_photo": {"params": [], "description": "保存当前 RGB 照片为 JPG。"},
+                    "analyze": {"params": ["image_path"],
+                                "description": ("分析照片亮度：返回平均亮度(0-255)、亮像素占比、"
+                                                "上部区域亮度和 lit/dark/uncertain 结论，"
+                                                "用于判断房间是否开灯。")},
                     "record_video": {"params": ["duration_s"],
                                      "description": "录制 RGB 视频，默认 5 秒。"},
                     "info": {"params": [], "description": "查看保存目录与相机状态。"},
@@ -4501,6 +4516,7 @@ class VisionCapturePlugin:
             path = directory / f"IMG_{stamp}.jpg"
             with path.open("xb") as output:
                 output.write(frame["data"])
+            self._last_photo_path = path
             return {
                 "ok": True, "media_type": "photo", "file_path": str(path),
                 "captured_at": datetime.now().astimezone().isoformat(timespec="seconds"),
@@ -4511,6 +4527,64 @@ class VisionCapturePlugin:
             if path is not None:
                 self._remove_partial(path)
             return {"ok": False, "code": "CAPTURE_FAILED", "message": str(exc)}
+
+    def _resolve_photo(self, image_path):
+        """Return a Path inside photos_dir, or raise ValueError."""
+        photos_dir = (self._output_dir / "photos").resolve()
+        if image_path:
+            candidate = Path(str(image_path)).expanduser()
+            if not candidate.is_absolute():
+                candidate = photos_dir / candidate
+            candidate = candidate.resolve()
+        elif self._last_photo_path is not None:
+            candidate = Path(self._last_photo_path).resolve()
+        else:
+            photos = sorted(photos_dir.glob("IMG_*.jpg")) if photos_dir.is_dir() else []
+            if not photos:
+                raise ValueError("no photo available; run capture_photo first")
+            candidate = photos[-1].resolve()
+        try:
+            candidate.relative_to(photos_dir)
+        except ValueError:
+            raise ValueError(f"image_path must be inside {photos_dir}")
+        if not candidate.is_file():
+            raise ValueError(f"photo not found: {candidate}")
+        return candidate
+
+    def _analyze_photo(self, args):
+        """Brightness statistics for a saved photo (no model, pure pixel stats)."""
+        try:
+            import cv2
+            import numpy as np
+            photo = self._resolve_photo((args or {}).get("image_path"))
+            data = np.frombuffer(photo.read_bytes(), dtype=np.uint8)
+            image = cv2.imdecode(data, cv2.IMREAD_COLOR)
+            if image is None:
+                raise ValueError(f"cannot decode image: {photo}")
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            height = gray.shape[0]
+            mean = float(gray.mean())
+            top_mean = float(gray[: max(1, height * 3 // 10)].mean())
+            bright_ratio = float((gray > 170).mean())
+            if mean >= self._lit_threshold or bright_ratio >= 0.15:
+                verdict = "lit"
+            elif mean <= self._dark_threshold and bright_ratio < 0.02:
+                verdict = "dark"
+            else:
+                verdict = "uncertain"
+            return {
+                "ok": True, "file_path": str(photo),
+                "brightness_mean": round(mean, 1),
+                "top_band_mean": round(top_mean, 1),
+                "bright_ratio": round(bright_ratio, 4),
+                "thresholds": {"dark": self._dark_threshold,
+                               "lit": self._lit_threshold},
+                "verdict": verdict,
+            }
+        except ValueError as exc:
+            return {"ok": False, "code": "INVALID_IMAGE", "message": str(exc)}
+        except Exception as exc:
+            return {"ok": False, "code": "ANALYZE_FAILED", "message": str(exc)}
 
     @staticmethod
     def _remove_partial(path):
@@ -4715,6 +4789,8 @@ class VisionCapturePlugin:
             return self._info()
         if action == "capture_photo":
             return self._capture_photo()
+        if action == "analyze":
+            return self._analyze_photo(args)
         if action == "record_video":
             return self._start_video_recording(args)
         if action == "stop":
